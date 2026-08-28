@@ -1,0 +1,337 @@
+rules_version = '2';
+/**
+ * STK Business Development Hub - Hardened Cloud Firestore Security Rules
+ * Target Database: stk-bizdev-hub-uat
+ * Server-Enforced Role-Based Access Control (RBAC) & Default-Deny Architecture
+ *
+ * Supported Roles:
+ * - ADMIN: System administrator with full governance, user lifecycle management, and master settings control
+ * - BDM_MANAGER: Sales leadership with team-wide oversight of targets, pipeline, tasks, and assignments
+ * - BDM: Business Development Manager with ownership of assigned targets, contacts, engagements, and deals
+ * - ACCOUNT_MANAGER: Account Manager managing post-referral delivery and assigned commercial opportunities
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================
+    // Core Security & Identity Helper Functions
+    // ==========================================
+
+    // Check if caller is authenticated via Firebase Auth
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    // Check if caller's profile document exists in Firestore
+    function userExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    // Retrieve caller's user document from /users/{uid}
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Verify caller has an active profile and an authorised role
+    function isActiveUser() {
+      return isSignedIn() &&
+        userExists() &&
+        getUserData().active == true &&
+        getUserData().role in ['ADMIN', 'BDM_MANAGER', 'BDM', 'ACCOUNT_MANAGER'];
+    }
+
+    // Get caller's verified role from Firestore document (never client-supplied)
+    function userRole() {
+      return getUserData().role;
+    }
+
+    // Role-specific evaluation helpers
+    function isAdmin() {
+      return isActiveUser() && userRole() == 'ADMIN';
+    }
+
+    function isBDMManager() {
+      return isActiveUser() && userRole() == 'BDM_MANAGER';
+    }
+
+    function isBDM() {
+      return isActiveUser() && userRole() == 'BDM';
+    }
+
+    function isAccountManager() {
+      return isActiveUser() && userRole() == 'ACCOUNT_MANAGER';
+    }
+
+    // Privileged sales & management roles (ADMIN and BDM_MANAGER)
+    function isManagerOrAdmin() {
+      return isActiveUser() && (userRole() == 'ADMIN' || userRole() == 'BDM_MANAGER');
+    }
+
+    // Opportunity status validation rule (strictly uses status, never 'stage')
+    function validOpportunityStatus() {
+      let status = request.resource.data.status;
+      return (status != 'WON' || (request.resource.data.closedDate != null && request.resource.data.winReason != null)) &&
+             (status != 'LOST' || (request.resource.data.closedDate != null && request.resource.data.lossReason != null));
+    }
+
+    // Canonical audit actor: every write must identify the authenticated Firebase user.
+    function validCreateAudit() {
+      return request.resource.data.createdBy == request.auth.uid &&
+             request.resource.data.updatedBy == request.auth.uid;
+    }
+
+    function validUpdateAudit() {
+      return request.resource.data.createdBy == resource.data.createdBy &&
+             request.resource.data.updatedBy == request.auth.uid;
+    }
+
+    // Task completion integrity for creates.
+    function validTaskCompletionCreate() {
+      let status = request.resource.data.status;
+      return (status == 'COMPLETED' &&
+              request.resource.data.completedBy == request.auth.uid &&
+              request.resource.data.completedDate != null) ||
+             (status != 'COMPLETED' &&
+              (!('completedBy' in request.resource.data) || request.resource.data.completedBy == null) &&
+              (!('completedDate' in request.resource.data) || request.resource.data.completedDate == null));
+    }
+
+    // Task completion integrity for updates. Existing completed tasks retain their
+    // original completion actor/date; a new completion must be performed by auth.uid.
+    function validTaskCompletionUpdate() {
+      let status = request.resource.data.status;
+      return (status == 'COMPLETED' &&
+              ((resource.data.status == 'COMPLETED' &&
+                request.resource.data.completedBy == resource.data.completedBy &&
+                request.resource.data.completedDate == resource.data.completedDate) ||
+               (resource.data.status != 'COMPLETED' &&
+                request.resource.data.completedBy == request.auth.uid &&
+                request.resource.data.completedDate != null))) ||
+             (status != 'COMPLETED' &&
+              (!('completedBy' in request.resource.data) || request.resource.data.completedBy == null) &&
+              (!('completedDate' in request.resource.data) || request.resource.data.completedDate == null));
+    }
+
+    // ==========================================
+    // 1. Users Collection (/users/{userId})
+    // ==========================================
+    match /users/{userId} {
+      // All active users may read the directory (for team dropdowns and collaboration)
+      // Newly authenticated users can read their own profile during initialization
+      allow read: if isSignedIn() && (request.auth.uid == userId || isActiveUser());
+
+      // Prevention of client-side privilege escalation:
+      // Self-registration is restricted to non-privileged standard role ('BDM') and docId == auth.uid
+      // Only ADMIN can provision other roles (BDM_MANAGER, ACCOUNT_MANAGER, ADMIN)
+      allow create: if request.resource.data.uid == userId && (
+        isAdmin() || (
+        isSignedIn() &&
+        request.auth.uid == userId &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.role == 'BDM' &&
+        request.resource.data.active == true &&
+        request.resource.data.email is string &&
+        request.resource.data.displayName is string
+        )
+      );
+
+      // Self-update allows only profile presentation fields (displayName, jobTitle, department, photoURL, updatedAt)
+      // Normal users CANNOT modify uid, role, or active status
+      allow update: if request.resource.data.uid == resource.data.uid && (
+        isAdmin() || (
+        isActiveUser() &&
+        request.auth.uid == userId &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.active == resource.data.active &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'jobTitle', 'department', 'photoURL', 'updatedAt'
+        ])
+        )
+      );
+
+      // Only ADMIN may delete user profiles
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 2. Organisations Collection (/organisations/{organisationId})
+    // ==========================================
+    match /organisations/{organisationId} {
+      // Shared market intelligence: All active users may read all organisations
+      allow read: if isActiveUser();
+
+      // Creation: Managers/Admins can create with any assignment.
+      // BDM can create self-assigned or unassigned organisations.
+      allow create: if validCreateAudit() && (
+        isManagerOrAdmin() || (
+          isBDM() && (
+            request.resource.data.assignedBDMId == request.auth.uid ||
+            request.resource.data.assignedBDMId == null
+          )
+        )
+      );
+
+      // Updates: Managers/Admins can update and reassign.
+      // BDM can update only if assigned, and CANNOT change assignedBDMId.
+      allow update: if validUpdateAudit() && (
+        isManagerOrAdmin() || (
+          isBDM() &&
+          resource.data.assignedBDMId == request.auth.uid &&
+          request.resource.data.assignedBDMId == resource.data.assignedBDMId
+        )
+      );
+
+      // Deletion: Restricted to ADMIN and BDM_MANAGER
+      allow delete: if isManagerOrAdmin();
+    }
+
+    // ==========================================
+    // 3. Contacts Collection (/contacts/{contactId})
+    // ==========================================
+    match /contacts/{contactId} {
+      // Shared command-chain visibility: All active users may read contacts
+      allow read: if isActiveUser();
+
+      // Creation allowed for Admins, Managers, and BDMs
+      allow create: if validCreateAudit() && (isManagerOrAdmin() || isBDM());
+
+      // Updates allowed for active users, organisationId and creator must remain immutable.
+      allow update: if validUpdateAudit() && (isManagerOrAdmin() || (
+        isActiveUser() &&
+        request.resource.data.organisationId == resource.data.organisationId
+      ));
+
+      // Deletion restricted to ADMIN and BDM_MANAGER
+      allow delete: if isManagerOrAdmin();
+    }
+
+    // ==========================================
+    // 4. Engagements Collection (/engagements/{engagementId})
+    // ==========================================
+    match /engagements/{engagementId} {
+      // Shared interaction history: All active users may read engagements
+      allow read: if isActiveUser();
+
+      // Creation: Active users can log interactions, createdBy must match auth.uid
+      allow create: if isActiveUser() && validCreateAudit();
+
+      // Update: Admin, BDM_MANAGER, or original creator; createdBy remains immutable
+      allow update: if validUpdateAudit() && (isManagerOrAdmin() || (
+        isActiveUser() &&
+        resource.data.createdBy == request.auth.uid
+      ));
+
+      // Deletion: Admin, BDM_MANAGER, or original creator
+      allow delete: if isManagerOrAdmin() || (
+        isActiveUser() && resource.data.createdBy == request.auth.uid
+      );
+    }
+
+    // ==========================================
+    // 5. Tasks Collection (/tasks/{taskId})
+    // ==========================================
+    match /tasks/{taskId} {
+      // Task privacy: Read restricted to Admin, BDM_MANAGER, assignee, or creator
+      allow read: if isManagerOrAdmin() || (
+        isActiveUser() && (
+          resource.data.assignedTo == request.auth.uid ||
+          resource.data.createdBy == request.auth.uid
+        )
+      );
+
+      // Creation: Managers can assign to anyone; non-managers can only self-assign
+      allow create: if validTaskCompletionCreate() && validCreateAudit() && (
+        isManagerOrAdmin() || (
+          isActiveUser() &&
+          request.resource.data.assignedTo == request.auth.uid
+        )
+      );
+
+      // Update: Managers can update anything.
+      // Non-managers (assignee or creator) cannot alter task ownership (createdBy or assignedTo)
+      allow update: if validTaskCompletionUpdate() && validUpdateAudit() && (
+        isManagerOrAdmin() || (
+          isActiveUser() && (
+            resource.data.assignedTo == request.auth.uid ||
+            resource.data.createdBy == request.auth.uid
+          ) &&
+          request.resource.data.assignedTo == resource.data.assignedTo
+        )
+      );
+
+      // Deletion: Admin, BDM_MANAGER, or task creator
+      allow delete: if isManagerOrAdmin() || (
+        isActiveUser() && resource.data.createdBy == request.auth.uid
+      );
+    }
+
+    // ==========================================
+    // 6. Opportunities Collection (/opportunities/{opportunityId})
+    // ==========================================
+    match /opportunities/{opportunityId} {
+      // Pipeline visibility: All active users may read opportunities and commercial pipeline
+      allow read: if isActiveUser();
+
+      // Creation: Managers can create with any owner; BDM must be owner; must pass status validator
+      allow create: if validOpportunityStatus() && validCreateAudit() && (
+        isManagerOrAdmin() || (
+          isBDM() && request.resource.data.bdmOwnerId == request.auth.uid
+        )
+      );
+
+      // Updates: Managers have full update rights.
+      // BDM owner can update owned opportunity without reassigning bdmOwnerId.
+      // Assigned Account Manager can update assigned deal without reassigning bdmOwnerId or accountManagerId.
+      allow update: if validOpportunityStatus() && validUpdateAudit() && (
+        isManagerOrAdmin() || (
+          isBDM() &&
+          resource.data.bdmOwnerId == request.auth.uid &&
+          request.resource.data.bdmOwnerId == resource.data.bdmOwnerId
+        ) || (
+          isAccountManager() &&
+          resource.data.accountManagerId == request.auth.uid &&
+          request.resource.data.bdmOwnerId == resource.data.bdmOwnerId &&
+          request.resource.data.accountManagerId == resource.data.accountManagerId
+        )
+      );
+
+      // Deletion: Restricted to ADMIN and BDM_MANAGER
+      allow delete: if isManagerOrAdmin();
+    }
+
+    // ==========================================
+    // 7. Notifications Collection (/notifications/{notificationId})
+    // ==========================================
+    match /notifications/{notificationId} {
+      // Recipient-only read
+      allow read: if isActiveUser() && resource.data.userId == request.auth.uid;
+
+      // Creation: Admin or user for their own userId
+      allow create: if isAdmin() || (
+        isActiveUser() && request.resource.data.userId == request.auth.uid
+      );
+
+      // Update: Recipient only; userId is immutable
+      allow update: if isActiveUser() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == resource.data.userId;
+
+      // Deletion: Recipient or Admin
+      allow delete: if isAdmin() || (
+        isActiveUser() && resource.data.userId == request.auth.uid
+      );
+    }
+
+    // ==========================================
+    // 8. Settings & Master Data (/settings/{settingId})
+    // ==========================================
+    match /settings/{settingId} {
+      // All active users may read system configurations
+      allow read: if isActiveUser();
+
+      // Only ADMIN can create, update, or delete settings
+      allow create, update, delete: if isAdmin();
+    }
+  }
+}

@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    background-color: #071521;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    min-height: 100vh;
+    background-color: #071521;
+    color: #f4f8fb;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background-color: #49bfAE;
+    color: #0e2a47;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #071521;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #24465f;
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #2f86b8;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #24465f #071521;
+  }
+
+  input,
+  textarea,
+  select {
+    color: #f4f8fb;
+    background-color: #0c2235;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: #8ea5b5;
+    opacity: 1;
+  }
+
+  option {
+    color: #f4f8fb;
+    background-color: #0c2235;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+}

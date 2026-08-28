@@ -1,0 +1,6 @@
+{
+  "name": "STK Business Development Hub",
+  "description": "Multi-user Business Development Target, Engagement and Opportunity Management Platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

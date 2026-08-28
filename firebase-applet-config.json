@@ -1,0 +1,12 @@
+{
+  "projectId": "stk-business-development-hub",
+  "appId": "1:607604777123:web:289ed08de65ab969501f16",
+  "apiKey": "AIzaSyDHs-bA8BLSd_N3ov2ecpetJ9E7SQ-refI",
+  "authDomain": "stk-business-development-hub.firebaseapp.com",
+  "firestoreDatabaseId": "stk-bixdev-hub-uat",
+  "storageBucket": "stk-business-development-hub.firebasestorage.app",
+  "messagingSenderId": "607604777123",
+  "measurementId": "",
+  "oAuthClientId": "",
+  "recaptchaSiteKey": ""
+}

@@ -1,0 +1,226 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile with role-based access control",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "displayName": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["BDM", "ACCOUNT_MANAGER", "BDM_MANAGER", "ADMIN"] },
+        "jobTitle": { "type": "string" },
+        "department": { "type": "string" },
+        "active": { "type": "boolean" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "email", "role", "active"]
+    },
+    "Organisation": {
+      "title": "Organisation",
+      "description": "Target organisation record with canonical name and aliases",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "aliases": { "type": "array" },
+        "category": { "type": "string", "enum": ["PRIMARY", "SECONDARY"] },
+        "sector": { "type": "string" },
+        "priority": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+        "status": { "type": "string", "enum": ["ACTIVE", "ON_HOLD", "INACTIVE", "ARCHIVED"] },
+        "assignedBDMId": { "type": "string" },
+        "location": { "type": "string" },
+        "website": { "type": "string" },
+        "description": { "type": "string" },
+        "notes": { "type": "string" },
+        "lastEngagementDate": { "type": "string", "format": "date-time" },
+        "nextFollowUpDate": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["name", "category", "sector", "priority", "status", "createdAt", "createdBy"]
+    },
+    "Contact": {
+      "title": "Contact",
+      "description": "Stakeholder contact within an organisation with reporting hierarchy",
+      "type": "object",
+      "properties": {
+        "organisationId": { "type": "string" },
+        "firstName": { "type": "string" },
+        "lastName": { "type": "string" },
+        "fullName": { "type": "string" },
+        "jobTitle": { "type": "string" },
+        "department": { "type": "string" },
+        "mobile": { "type": "string" },
+        "landline": { "type": "string" },
+        "email": { "type": "string" },
+        "gender": { "type": "string" },
+        "reportsToContactId": { "type": "string" },
+        "decisionRole": {
+          "type": "string",
+          "enum": ["DECISION_MAKER", "INFLUENCER", "TECHNICAL_EVALUATOR", "PROCUREMENT", "GATEKEEPER", "USER", "GENERAL_CONTACT", "UNKNOWN"]
+        },
+        "influenceLevel": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW", "UNKNOWN"] },
+        "relationshipStrength": { "type": "string", "enum": ["STRONG", "MODERATE", "WEAK", "NEW", "UNKNOWN"] },
+        "status": { "type": "string", "enum": ["ACTIVE", "INACTIVE"] },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["organisationId", "firstName", "lastName", "fullName", "decisionRole", "status", "createdAt", "createdBy"]
+    },
+    "Engagement": {
+      "title": "Engagement",
+      "description": "Business engagement log",
+      "type": "object",
+      "properties": {
+        "organisationId": { "type": "string" },
+        "contactId": { "type": "string" },
+        "assignedTo": { "type": "string" },
+        "engagementType": {
+          "type": "string",
+          "enum": ["EMAIL", "PHONE_CALL", "SMS", "MEETING_ONSITE", "MEETING_EVENT", "MEETING_COFFEE", "LINKEDIN", "VIDEO_CONFERENCE", "OTHER"]
+        },
+        "engagementDate": { "type": "string", "format": "date-time" },
+        "purpose": {
+          "type": "string",
+          "enum": ["BUSINESS_INTRODUCTION", "CONTACT_ESTABLISHMENT", "MEET_AND_GREET", "FOLLOW_UP", "REFERRAL", "DISCOVERY", "OPPORTUNITY_DISCUSSION", "PROPOSAL_DISCUSSION", "OTHER"]
+        },
+        "details": { "type": "string" },
+        "outcome": { "type": "string" },
+        "status": { "type": "string", "enum": ["OPEN", "IN_PROGRESS", "COMPLETED", "CLOSED", "ON_HOLD"] },
+        "engagementCycle": { "type": "number" },
+        "engagementCycleDescription": { "type": "string" },
+        "nextEngagementDate": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["organisationId", "assignedTo", "engagementType", "engagementDate", "purpose", "details", "outcome", "status", "createdAt", "createdBy"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "Follow-up and action item",
+      "type": "object",
+      "properties": {
+        "organisationId": { "type": "string" },
+        "contactId": { "type": "string" },
+        "engagementId": { "type": "string" },
+        "opportunityId": { "type": "string" },
+        "assignedTo": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "dueDate": { "type": "string", "format": "date-time" },
+        "priority": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+        "status": { "type": "string", "enum": ["OPEN", "IN_PROGRESS", "COMPLETED", "CANCELLED"] },
+        "completedDate": { "type": "string", "format": "date-time" },
+        "completedBy": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["organisationId", "assignedTo", "title", "dueDate", "priority", "status", "createdAt", "createdBy"]
+    },
+    "Opportunity": {
+      "title": "Opportunity",
+      "description": "Sales opportunity / referral pipeline item",
+      "type": "object",
+      "properties": {
+        "organisationId": { "type": "string" },
+        "contactId": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "solutionCategory": { "type": "string" },
+        "discoveredDate": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["OPEN", "WON", "LOST", "UNCONVERTED"] },
+        "pipelineStage": {
+          "type": "string",
+          "enum": ["IDENTIFIED", "QUALIFIED", "DISCOVERY", "SOLUTION_DEVELOPMENT", "PROPOSAL", "NEGOTIATION", "CLOSED"]
+        },
+        "estimatedValue": { "type": "number" },
+        "currency": { "type": "string" },
+        "bdmOwnerId": { "type": "string" },
+        "accountManagerId": { "type": "string" },
+        "referredDate": { "type": "string", "format": "date-time" },
+        "closedDate": { "type": "string", "format": "date-time" },
+        "winReason": { "type": "string" },
+        "lossReason": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["organisationId", "title", "solutionCategory", "discoveredDate", "status", "pipelineStage", "estimatedValue", "currency", "bdmOwnerId", "createdAt", "createdBy"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "System and task notifications",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "type": { "type": "string", "enum": ["TASK_OVERDUE", "TASK_DUE_TODAY", "FOLLOW_UP_DUE", "OPPORTUNITY_UPDATE", "SYSTEM"] },
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "relatedEntityType": { "type": "string" },
+        "relatedEntityId": { "type": "string" },
+        "read": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "type", "title", "message", "read", "createdAt"]
+    },
+    "Setting": {
+      "title": "Setting",
+      "description": "Master data and application settings",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "values": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["key", "values"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profiles and RBAC information"
+    },
+    "/organisations/{organisationId}": {
+      "schema": { "$ref": "#/entities/Organisation" },
+      "description": "Target organisations and metadata"
+    },
+    "/contacts/{contactId}": {
+      "schema": { "$ref": "#/entities/Contact" },
+      "description": "Stakeholder contacts and reporting hierarchy"
+    },
+    "/engagements/{engagementId}": {
+      "schema": { "$ref": "#/entities/Engagement" },
+      "description": "Engagement log history"
+    },
+    "/tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/Task" },
+      "description": "Follow-up tasks and action items"
+    },
+    "/opportunities/{opportunityId}": {
+      "schema": { "$ref": "#/entities/Opportunity" },
+      "description": "Opportunities and pipeline records"
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "User notifications"
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/Setting" },
+      "description": "Configurable master data and lists"
+    }
+  }
+}
