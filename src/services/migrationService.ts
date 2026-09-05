@@ -1,10 +1,9 @@
 import * as XLSX from 'xlsx';
-import { Organisation, Contact, Engagement, Opportunity, Task } from '../types';
-import { organisationService, calculateSimilarity, normalizeString } from './organisationService';
-import { contactService } from './contactService';
-import { engagementService } from './engagementService';
-import { opportunityService } from './opportunityService';
-import { taskService } from './taskService';
+import { collection, doc, getDocs, writeBatch } from 'firebase/firestore';
+import { auth, db } from '../config/firebase';
+import { Organisation, Contact, UserProfile } from '../types';
+import { normalizeString, calculateSimilarity } from './organisationService';
+import { businessImportPlanner, ImportPlan } from './businessImportPlanner';
 
 export interface ParsedWorksheet {
   sheetName: string;
@@ -13,10 +12,7 @@ export interface ParsedWorksheet {
   rows: Record<string, any>[];
 }
 
-export interface WorkbookParseResult {
-  fileName: string;
-  sheets: ParsedWorksheet[];
-}
+export interface WorkbookParseResult { fileName: string; sheets: ParsedWorksheet[]; }
 
 export interface MigrationSummaryReport {
   totalSheetsProcessed: number;
@@ -33,586 +29,176 @@ export interface MigrationSummaryReport {
   detailedLogs: string[];
 }
 
+const cleanKey = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+const field = (row: Record<string, any>, aliases: string[]) => {
+  const keys = Object.keys(row);
+  for (const alias of aliases) {
+    const key = keys.find((candidate) => cleanKey(candidate) === cleanKey(alias));
+    if (key !== undefined && row[key] !== null && row[key] !== undefined) return String(row[key]).trim();
+  }
+  return '';
+};
+const parseDate = (value: unknown): string | null => {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+  if (typeof value === 'number') {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (!parsed) return null;
+    return new Date(Date.UTC(parsed.y, parsed.m - 1, parsed.d, parsed.H || 0, parsed.M || 0, parsed.S || 0)).toISOString();
+  }
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+const similarityMatch = (name: string, orgs: Organisation[]) => {
+  const candidate = normalizeString(name);
+  if (!candidate) return null;
+  const exact = orgs.find((o) => normalizeString(o.name) === candidate);
+  if (exact) return { org: exact, confidence: 100 };
+  const alias = orgs.find((o) => (o.aliases || []).some((a) => normalizeString(a) === candidate));
+  if (alias) return { org: alias, confidence: 98 };
+  let best: { org: Organisation; confidence: number } | null = null;
+  for (const org of orgs) {
+    const confidence = Math.round(calculateSimilarity(candidate, normalizeString(org.name)) * 100);
+    if (confidence >= 85 && (!best || confidence > best.confidence)) best = { org, confidence };
+  }
+  return best;
+};
+
+const classify = (name: string, headers: string[]): ParsedWorksheet['recognizedType'] => {
+  const sheet = cleanKey(name); const keys = headers.map(cleanKey);
+  if (sheet.includes('dashboard')) return 'UNKNOWN';
+  if (sheet.includes('target')) return 'TARGETS';
+  if (sheet.includes('cmdchain') || sheet.includes('commandchain') || sheet.includes('contact') || sheet.includes('heatmap')) return 'CONTACTS';
+  if (sheet.includes('worklist') || sheet.includes('engagement') || sheet.includes('task')) return 'WORKLIST';
+  if (sheet.includes('opp') || sheet.includes('sales') || sheet.includes('referral') || sheet.includes('pipeline')) return 'OPPORTUNITIES';
+  if (keys.includes('eid') && keys.includes('entity')) return 'TARGETS';
+  if (keys.includes('pid') || keys.includes('reportstopid')) return 'CONTACTS';
+  if (keys.includes('engagementdate') || keys.includes('engagementtype')) return 'WORKLIST';
+  if (keys.includes('estimateddealsize') || keys.includes('osrstatus')) return 'OPPORTUNITIES';
+  return 'UNKNOWN';
+};
+
 export const migrationService = {
-  /**
-   * Parse XLSX Workbook or CSV from ArrayBuffer or raw text
-   */
   parseWorkbook(data: ArrayBuffer | string, fileName: string): WorkbookParseResult {
-    let workbook: XLSX.WorkBook;
+    const workbook = XLSX.read(data, { type: typeof data === 'string' ? 'string' : 'array', cellDates: true, raw: true });
+    return {
+      fileName,
+      sheets: workbook.SheetNames.map((sheetName) => {
+        const rows = XLSX.utils.sheet_to_json<Record<string, any>>(workbook.Sheets[sheetName], { defval: '', raw: true });
+        const headers = rows.length ? Object.keys(rows[0]) : [];
+        return { sheetName, recognizedType: classify(sheetName, headers), headers, rows };
+      }).filter((sheet) => sheet.rows.length > 0),
+    };
+  },
 
-    if (typeof data === 'string') {
-      workbook = XLSX.read(data, { type: 'string' });
-    } else {
-      workbook = XLSX.read(data, { type: 'array' });
-    }
+  getField: field,
+  normalizeOrgName: normalizeString,
+  matchOrganisation(rawName: string, existingOrgs: Organisation[]): Organisation | null { return similarityMatch(rawName, existingOrgs)?.org || null; },
 
-    const sheets: ParsedWorksheet[] = [];
-
-    workbook.SheetNames.forEach((sheetName) => {
-      const worksheet = workbook.Sheets[sheetName];
-      const jsonRows = XLSX.utils.sheet_to_json<Record<string, any>>(worksheet, {
-        defval: '',
-        raw: false,
-      });
-
-      if (jsonRows.length === 0) return;
-
-      const headers = Object.keys(jsonRows[0] || {});
-      const normSheet = sheetName.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-      let recognizedType: ParsedWorksheet['recognizedType'] = 'UNKNOWN';
-
-      if (
-        normSheet.includes('target') ||
-        normSheet.includes('organisation') ||
-        normSheet.includes('org') ||
-        headers.some((h) => /org|target|company|client/i.test(h) && /category|sector|priority/i.test(h))
-      ) {
-        recognizedType = 'TARGETS';
-      } else if (
-        normSheet.includes('cmdchain') ||
-        normSheet.includes('commandchain') ||
-        normSheet.includes('contact') ||
-        normSheet.includes('stakeholder') ||
-        normSheet.includes('heatmap') ||
-        headers.some((h) => /reportsto|decisionrole|influence/i.test(h))
-      ) {
-        recognizedType = 'CONTACTS';
-      } else if (
-        normSheet.includes('worklist') ||
-        normSheet.includes('task') ||
-        normSheet.includes('engagement') ||
-        headers.some((h) => /duedate|engagementtype|purpose|action/i.test(h))
-      ) {
-        recognizedType = 'WORKLIST';
-      } else if (
-        normSheet.includes('opp') ||
-        normSheet.includes('sales') ||
-        normSheet.includes('referral') ||
-        normSheet.includes('deal') ||
-        headers.some((h) => /estimatedvalue|pipelinestage|solution/i.test(h))
-      ) {
-        recognizedType = 'OPPORTUNITIES';
-      }
-
-      sheets.push({
-        sheetName,
-        recognizedType,
-        headers,
-        rows: jsonRows,
-      });
-    });
-
-    return { fileName, sheets };
+  async createImportPlan(workbookResult: WorkbookParseResult): Promise<ImportPlan> {
+    const [orgSnap, contactSnap, userSnap] = await Promise.all([
+      getDocs(collection(db, 'organisations')),
+      getDocs(collection(db, 'contacts')),
+      getDocs(collection(db, 'users')),
+    ]);
+    const organisations = orgSnap.docs.map((d) => ({ id: d.id, ...d.data() })) as Organisation[];
+    const contacts = contactSnap.docs.map((d) => ({ id: d.id, ...d.data() })) as Contact[];
+    const users = userSnap.docs.map((d) => ({ uid: d.id, ...d.data() })) as UserProfile[];
+    const parsed = {
+      workbook: XLSX.utils.book_new(),
+      sheets: workbookResult.sheets.map((s) => ({ sheetName: s.sheetName, type: s.recognizedType === 'UNKNOWN' ? 'UNKNOWN' : s.recognizedType, rowCount: s.rows.length, headers: s.headers, mappings: [] })),
+      rows: new Map(workbookResult.sheets.map((s) => [s.sheetName, s.rows as Record<string, unknown>[]])),
+    } as ReturnType<typeof businessImportPlanner.parse>;
+    return businessImportPlanner.buildPlan(parsed, workbookResult.fileName, organisations, contacts, users);
   },
 
   /**
-   * Helper to find matching string key case-insensitively
+   * Commit only an already-reviewed plan. No automatic fallback organisation is permitted.
+   * All document IDs are allocated before the batch is committed so relationships are deterministic.
    */
-  getField(row: Record<string, any>, possibleKeys: string[]): string {
-    const rowKeys = Object.keys(row);
-    for (const target of possibleKeys) {
-      const match = rowKeys.find(
-        (k) => k.toLowerCase().replace(/[^a-z0-9]/g, '') === target.toLowerCase().replace(/[^a-z0-9]/g, '')
-      );
-      if (match && row[match] !== undefined && row[match] !== null) {
-        return String(row[match]).trim();
-      }
-    }
-    return '';
-  },
+  async commitImport(workbookResult: WorkbookParseResult, plan: ImportPlan, user: UserProfile): Promise<MigrationSummaryReport> {
+    if (!auth.currentUser?.uid) throw new Error('Authentication is required to import data.');
+    if (auth.currentUser.uid !== user.uid) throw new Error('Authenticated user does not match the import operator.');
+    if (user.role !== 'ADMIN' || user.active !== true) throw new Error('Administrator privileges are required to commit an import.');
+    if (!plan.readyForReview || plan.issues.some((issue) => issue.severity === 'ERROR')) throw new Error('Import cannot be committed while validation errors remain.');
 
-  /**
-   * Normalize an Organisation name for matching
-   */
-  normalizeOrgName(name: string): string {
-    return normalizeString(name);
-  },
-
-  /**
-   * Match an Organisation by Exact name, Canonical Alias, or High Similarity
-   */
-  matchOrganisation(rawName: string, existingOrgs: Organisation[]): Organisation | null {
-    if (!rawName) return null;
-    const cleanRaw = this.normalizeOrgName(rawName);
-
-    // Exact name match
-    const exact = existingOrgs.find((o) => this.normalizeOrgName(o.name) === cleanRaw);
-    if (exact) return exact;
-
-    // Alias match
-    const aliasMatch = existingOrgs.find((o) =>
-      o.aliases.some((alias) => this.normalizeOrgName(alias) === cleanRaw)
-    );
-    if (aliasMatch) return aliasMatch;
-
-    // High similarity match (>= 85%)
-    let bestMatch: Organisation | null = null;
-    let highestSim = 0;
-    for (const org of existingOrgs) {
-      const sim = calculateSimilarity(cleanRaw, this.normalizeOrgName(org.name));
-      if (sim >= 85 && sim > highestSim) {
-        highestSim = sim;
-        bestMatch = org;
-      }
-    }
-
-    return bestMatch;
-  },
-
-  /**
-   * Execute Full 13-Step Automated Workbook Migration Workflow
-   */
-  async executeMigration(
-    workbookResult: WorkbookParseResult,
-    userId: string,
-    userName: string
-  ): Promise<MigrationSummaryReport> {
+    const [orgSnap, contactSnap] = await Promise.all([getDocs(collection(db, 'organisations')), getDocs(collection(db, 'contacts'))]);
+    const existingOrgs = orgSnap.docs.map((d) => ({ id: d.id, ...d.data() })) as Organisation[];
+    const existingContacts = contactSnap.docs.map((d) => ({ id: d.id, ...d.data() })) as Contact[];
+    const batch = writeBatch(db);
+    const now = new Date().toISOString();
     const report: MigrationSummaryReport = {
-      totalSheetsProcessed: 0,
-      organisationsCreated: 0,
-      organisationsMatched: 0,
-      organisationsSkipped: 0,
-      contactsCreated: 0,
-      contactsHierarchyLinked: 0,
-      contactsHierarchyUnresolved: 0,
-      engagementsCreated: 0,
-      tasksCreated: 0,
-      opportunitiesCreated: 0,
-      validationErrors: [],
-      detailedLogs: [],
+      totalSheetsProcessed: 0, organisationsCreated: 0, organisationsMatched: 0, organisationsSkipped: 0,
+      contactsCreated: 0, contactsHierarchyLinked: 0, contactsHierarchyUnresolved: 0, engagementsCreated: 0,
+      tasksCreated: 0, opportunitiesCreated: 0, validationErrors: [], detailedLogs: [`Approved import: ${workbookResult.fileName}`],
     };
 
-    report.detailedLogs.push(`Starting migration for workbook: ${workbookResult.fileName}`);
-
-    // Load existing database entities
-    let existingOrgs = await organisationService.getAll();
-    let existingContacts = await contactService.getAll();
-
-    // In-memory maps for linking during import
-    // Map: legacyOrgNameOrId -> canonical OrgId
-    const orgIdMap = new Map<string, string>();
-    // Map: legacyContactPidOrName -> new ContactId
-    const contactIdMap = new Map<string, string>();
-    // Map: new ContactId -> legacy ReportsTo PID / Name
-    const contactReportsToPending = new Map<string, string>();
-
-    // Index existing orgs into map
-    existingOrgs.forEach((o) => {
-      orgIdMap.set(o.id, o.id);
-      orgIdMap.set(this.normalizeOrgName(o.name), o.id);
-      o.aliases.forEach((a) => orgIdMap.set(this.normalizeOrgName(a), o.id));
-    });
-
-    // ----------------------------------------------------
-    // STEP 1 & 2: Process TARGETS Worksheet (Organisations)
-    // ----------------------------------------------------
-    const targetsSheet = workbookResult.sheets.find((s) => s.recognizedType === 'TARGETS');
-    if (targetsSheet) {
-      report.totalSheetsProcessed++;
-      report.detailedLogs.push(`Processing Targets Sheet "${targetsSheet.sheetName}" with ${targetsSheet.rows.length} rows...`);
-
-      for (let i = 0; i < targetsSheet.rows.length; i++) {
-        const row = targetsSheet.rows[i];
-        const rawName = this.getField(row, ['Name', 'OrganisationName', 'Organisation', 'TargetName', 'Company']);
-        const legacyId = this.getField(row, ['ID', 'TargetID', 'OrgID', 'PID', 'Code']);
-
-        if (!rawName) {
-          report.validationErrors.push({
-            entity: 'Targets',
-            row: i + 1,
-            error: 'Organisation Name is missing.',
-          });
-          continue;
-        }
-
-        // Check if organisation already exists
-        const matched = this.matchOrganisation(rawName, existingOrgs);
-        if (matched) {
-          report.organisationsMatched++;
-          orgIdMap.set(this.normalizeOrgName(rawName), matched.id);
-          if (legacyId) orgIdMap.set(legacyId, matched.id);
-          report.detailedLogs.push(`Row ${i + 1}: Matched "${rawName}" to existing target "${matched.name}".`);
-          continue;
-        }
-
-        // Create new organisation
-        const categoryRaw = this.getField(row, ['Category', 'Type']).toUpperCase();
-        const category = categoryRaw.includes('SEC') ? 'SECONDARY' : 'PRIMARY';
-
-        const priorityRaw = this.getField(row, ['Priority', 'Tier']).toUpperCase();
-        const priority = priorityRaw.includes('HIGH') || priorityRaw.includes('P1')
-          ? 'HIGH'
-          : priorityRaw.includes('LOW') || priorityRaw.includes('P3')
-          ? 'LOW'
-          : 'MEDIUM';
-
-        const statusRaw = this.getField(row, ['Status']).toUpperCase();
-        const status = statusRaw.includes('HOLD')
-          ? 'ON_HOLD'
-          : statusRaw.includes('INACT') || statusRaw.includes('ARCH')
-          ? 'INACTIVE'
-          : 'ACTIVE';
-
-        const sector = this.getField(row, ['Sector', 'Industry', 'Vertical']) || 'Commercial & Enterprise';
-        const rawAliases = this.getField(row, ['Aliases', 'Alias', 'ShortName', 'Acronym']);
-        const aliases = rawAliases
-          ? rawAliases.split(/[,;]+/).map((a) => a.trim()).filter(Boolean)
-          : [];
-        const location = this.getField(row, ['Location', 'City', 'Province', 'Address']) || 'Papua New Guinea';
-        const website = this.getField(row, ['Website', 'URL', 'Web']);
-        const description = this.getField(row, ['Description', 'Profile', 'Overview']);
-        const notes = this.getField(row, ['Notes', 'Commentary', 'StrategicObjective']);
-
-        try {
-          const createdOrg = await organisationService.create({
-            name: rawName,
-            category,
-            sector,
-            priority,
-            status,
-            aliases,
-            location,
-            website,
-            description,
-            notes,
-            assignedBDMId: userId,
-            lastEngagementDate: null,
-            nextFollowUpDate: null,
-            createdBy: userId,
-            updatedBy: userId,
-            createdByName: userName,
-            updatedByName: userName,
-          });
-
-          existingOrgs.push(createdOrg);
-          orgIdMap.set(this.normalizeOrgName(rawName), createdOrg.id);
-          if (legacyId) orgIdMap.set(legacyId, createdOrg.id);
-          report.organisationsCreated++;
-          report.detailedLogs.push(`Row ${i + 1}: Created new organisation "${rawName}" (ID: ${createdOrg.id}).`);
-        } catch (err: any) {
-          report.validationErrors.push({
-            entity: 'Targets',
-            row: i + 1,
-            error: `Failed to write organisation: ${err.message}`,
-          });
-        }
-      }
+    const orgMap = new Map<string, string>();
+    existingOrgs.forEach((o) => { orgMap.set(normalizeString(o.name), o.id); (o.aliases || []).forEach((a) => orgMap.set(normalizeString(a), o.id)); });
+    const targetSheet = workbookResult.sheets.find((s) => s.recognizedType === 'TARGETS');
+    for (const [index, row] of (targetSheet?.rows || []).entries()) {
+      const name = field(row, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client', 'TargetName', 'Name']);
+      const sourceId = field(row, ['EID', 'ID', 'TargetID', 'OrgID']);
+      if (!name) { report.validationErrors.push({ entity: 'Targets', row: index + 1, error: 'Organisation name is missing.' }); continue; }
+      const existing = similarityMatch(name, existingOrgs);
+      if (existing && existing.confidence >= 95) { orgMap.set(normalizeString(name), existing.org.id); report.organisationsMatched++; continue; }
+      if (existing) { report.organisationsSkipped++; report.validationErrors.push({ entity: 'Targets', row: index + 1, error: `Ambiguous organisation match requires review: ${name} → ${existing.org.name} (${existing.confidence}%).` }); continue; }
+      const ref = doc(collection(db, 'organisations')); const aliases = field(row, ['Aliases', 'Alias', 'Acronym']).split(/[,;]+/).map((v) => v.trim()).filter(Boolean);
+      const rawStatus = field(row, ['Status']).toUpperCase();
+      const status = rawStatus.includes('HOLD') ? 'ON_HOLD' : rawStatus.includes('ARCH') ? 'ARCHIVED' : rawStatus.includes('INACT') ? 'INACTIVE' : 'ACTIVE';
+      const rawPriority = field(row, ['Priority', 'Tier']).toUpperCase();
+      const priority = rawPriority.includes('HIGH') || rawPriority.includes('P1') ? 'HIGH' : rawPriority.includes('LOW') || rawPriority.includes('P3') ? 'LOW' : 'MEDIUM';
+      const organisation: Organisation = { id: ref.id, name, aliases, category: field(row, ['Category', 'Type']).toUpperCase().includes('SEC') ? 'SECONDARY' : 'PRIMARY', sector: field(row, ['Sector', 'Industry', 'Vertical']) || 'Commercial & Enterprise', priority, status, assignedBDMId: user.uid, location: field(row, ['Location', 'City', 'Province', 'Address']) || '', website: field(row, ['Website', 'URL', 'Web']), description: field(row, ['Description', 'Profile', 'Overview']), notes: field(row, ['Notes', 'Commentary', 'StrategicObjective']), lastEngagementDate: null, nextFollowUpDate: null, createdAt: now, createdBy: user.uid, updatedAt: now, updatedBy: user.uid };
+      batch.set(ref, organisation); orgMap.set(normalizeString(name), ref.id); if (sourceId) orgMap.set(normalizeString(sourceId), ref.id); report.organisationsCreated++; report.detailedLogs.push(`Created organisation: ${name}`);
     }
+    report.totalSheetsProcessed += targetSheet ? 1 : 0;
 
-    // ----------------------------------------------------
-    // STEP 3 & 4: Process CONTACTS Worksheet (CmdChainHeatMap)
-    // ----------------------------------------------------
-    const contactsSheet = workbookResult.sheets.find((s) => s.recognizedType === 'CONTACTS');
-    if (contactsSheet) {
-      report.totalSheetsProcessed++;
-      report.detailedLogs.push(`Processing Contacts Sheet "${contactsSheet.sheetName}" with ${contactsSheet.rows.length} rows...`);
-
-      // PASS 1: Create Contact records
-      for (let i = 0; i < contactsSheet.rows.length; i++) {
-        const row = contactsSheet.rows[i];
-        const fullName = this.getField(row, ['FullName', 'Name', 'ContactName', 'Contact', 'Stakeholder']);
-        const firstName = this.getField(row, ['FirstName', 'GivenName']);
-        const lastName = this.getField(row, ['LastName', 'Surname', 'FamilyName']);
-        const legacyPid = this.getField(row, ['PID', 'ContactID', 'ID', 'StakeholderID', 'Code']);
-        const legacyReportsTo = this.getField(row, ['ReportsToPID', 'ReportsTo', 'ManagerPID', 'ReportsToName', 'Supervisor']);
-
-        const orgNameOrId = this.getField(row, ['OrganisationName', 'Organisation', 'TargetName', 'Company', 'OrgID', 'TargetID']);
-        let targetOrgId = '';
-
-        if (orgNameOrId) {
-          targetOrgId = orgIdMap.get(orgNameOrId) || orgIdMap.get(this.normalizeOrgName(orgNameOrId)) || '';
-          if (!targetOrgId) {
-            const match = this.matchOrganisation(orgNameOrId, existingOrgs);
-            if (match) targetOrgId = match.id;
-          }
-        }
-
-        if (!targetOrgId && existingOrgs.length > 0) {
-          targetOrgId = existingOrgs[0].id;
-        }
-
-        if (!fullName && !firstName) {
-          report.validationErrors.push({
-            entity: 'Contacts',
-            row: i + 1,
-            error: 'Contact FullName / FirstName is required.',
-          });
-          continue;
-        }
-
-        const computedFullName = fullName || `${firstName} ${lastName}`.trim();
-        const parts = computedFullName.split(' ');
-        const finalFirstName = firstName || parts[0] || 'Stakeholder';
-        const finalLastName = lastName || parts.slice(1).join(' ') || '';
-
-        const jobTitle = this.getField(row, ['JobTitle', 'Title', 'Role', 'Position']) || 'Stakeholder';
-        const department = this.getField(row, ['Department', 'Division', 'Unit', 'Dept']) || 'Executive';
-        const email = this.getField(row, ['Email', 'EmailAddress', 'WorkEmail']);
-        const mobile = this.getField(row, ['Mobile', 'Phone', 'Cell', 'Telephone']);
-        const landline = this.getField(row, ['Landline', 'OfficePhone', 'DirectLine']);
-
-        const decisionRoleRaw = this.getField(row, ['DecisionRole', 'RoleInDecision', 'InfluenceType']).toUpperCase();
-        const decisionRole = decisionRoleRaw.includes('DECISION') || decisionRoleRaw.includes('MAKER')
-          ? 'DECISION_MAKER'
-          : decisionRoleRaw.includes('TECH')
-          ? 'TECHNICAL_EVALUATOR'
-          : decisionRoleRaw.includes('PROC') || decisionRoleRaw.includes('BUY')
-          ? 'PROCUREMENT'
-          : decisionRoleRaw.includes('GATE')
-          ? 'GATEKEEPER'
-          : decisionRoleRaw.includes('USER')
-          ? 'USER'
-          : 'INFLUENCER';
-
-        const influenceRaw = this.getField(row, ['InfluenceLevel', 'Influence', 'Power']).toUpperCase();
-        const influenceLevel = influenceRaw.includes('HIGH') || influenceRaw.includes('H')
-          ? 'HIGH'
-          : influenceRaw.includes('LOW') || influenceRaw.includes('L')
-          ? 'LOW'
-          : 'MEDIUM';
-
-        const relationRaw = this.getField(row, ['RelationshipStrength', 'Relationship', 'Sentiment']).toUpperCase();
-        const relationshipStrength = relationRaw.includes('STRONG')
-          ? 'STRONG'
-          : relationRaw.includes('WEAK')
-          ? 'WEAK'
-          : relationRaw.includes('NEW')
-          ? 'NEW'
-          : 'MODERATE';
-
-        try {
-          const createdContact = await contactService.create({
-            organisationId: targetOrgId,
-            firstName: finalFirstName,
-            lastName: finalLastName,
-            jobTitle,
-            department,
-            email,
-            mobile,
-            landline,
-            gender: null,
-            decisionRole,
-            influenceLevel,
-            relationshipStrength,
-            status: 'ACTIVE',
-            reportsToContactId: null, // Linked in pass 2
-            notes: this.getField(row, ['Notes', 'Comments']),
-            createdBy: userId,
-            updatedBy: userId,
-            createdByName: userName,
-            updatedByName: userName,
-          });
-
-          existingContacts.push(createdContact);
-          report.contactsCreated++;
-
-          if (legacyPid) contactIdMap.set(legacyPid, createdContact.id);
-          contactIdMap.set(computedFullName.toLowerCase(), createdContact.id);
-
-          if (legacyReportsTo) {
-            contactReportsToPending.set(createdContact.id, legacyReportsTo);
-          }
-
-          report.detailedLogs.push(`Row ${i + 1}: Created contact "${computedFullName}" for org ${targetOrgId}.`);
-        } catch (err: any) {
-          report.validationErrors.push({
-            entity: 'Contacts',
-            row: i + 1,
-            error: `Failed to create contact: ${err.message}`,
-          });
-        }
-      }
-
-      // PASS 2: Resolve ReportsTo Hierarchy
-      report.detailedLogs.push(`Resolving command chain hierarchy for ${contactReportsToPending.size} contacts...`);
-      for (const [contactId, legacyParentRef] of contactReportsToPending.entries()) {
-        const parentContactId =
-          contactIdMap.get(legacyParentRef) ||
-          contactIdMap.get(legacyParentRef.toLowerCase()) ||
-          existingContacts.find((c) => c.fullName.toLowerCase() === legacyParentRef.toLowerCase())?.id;
-
-        if (parentContactId && parentContactId !== contactId) {
-          try {
-            await contactService.update(contactId, { reportsToContactId: parentContactId });
-            report.contactsHierarchyLinked++;
-          } catch (e) {
-            report.contactsHierarchyUnresolved++;
-          }
-        } else {
-          report.contactsHierarchyUnresolved++;
-          report.detailedLogs.push(`Could not resolve supervisor reference "${legacyParentRef}" for contact ID ${contactId}.`);
-        }
-      }
+    const contactMap = new Map<string, string>(); const pendingParents: Array<{ id: string; ref: string }> = [];
+    const contactSheet = workbookResult.sheets.find((s) => s.recognizedType === 'CONTACTS');
+    for (const [index, row] of (contactSheet?.rows || []).entries()) {
+      const orgName = field(row, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client', 'TargetName', 'OrgID']);
+      const orgId = orgMap.get(normalizeString(orgName));
+      if (!orgId) { report.contactsHierarchyUnresolved++; report.validationErrors.push({ entity: 'Contacts', row: index + 1, error: `Organisation could not be resolved: ${orgName || '(blank)'}.` }); continue; }
+      const first = field(row, ['Fname', 'FirstName', 'GivenName']); const last = field(row, ['Lname', 'LastName', 'Surname']); const full = field(row, ['FullName', 'Name', 'ContactName', 'Stakeholder']) || `${first} ${last}`.trim();
+      if (!full || !first && !last) { report.validationErrors.push({ entity: 'Contacts', row: index + 1, error: 'Contact name is missing.' }); continue; }
+      const parts = full.split(/\s+/); const firstName = first || parts[0]; const lastName = last || parts.slice(1).join(' ');
+      const ref = doc(collection(db, 'contacts')); const pid = field(row, ['PID', 'ContactID', 'ID', 'StakeholderID']);
+      const contact: Contact = { id: ref.id, organisationId: orgId, firstName, lastName, fullName: `${firstName} ${lastName}`.trim(), jobTitle: field(row, ['Role', 'JobTitle', 'Title', 'Position']) || 'Stakeholder', department: field(row, ['Department', 'Division', 'Unit', 'Dept']), mobile: field(row, ['Mobile', 'Phone', 'Cell', 'Telephone']), landline: field(row, ['Landline', 'OfficePhone', 'DirectLine']), email: field(row, ['Email', 'EmailAddress', 'WorkEmail']), gender: field(row, ['Gender']) || null, reportsToContactId: null, decisionRole: 'UNKNOWN', influenceLevel: 'UNKNOWN', relationshipStrength: 'UNKNOWN', status: 'ACTIVE', notes: field(row, ['Notes', 'Comments']), createdAt: now, createdBy: user.uid, updatedAt: now, updatedBy: user.uid };
+      batch.set(ref, contact); contactMap.set(pid || normalizeString(full), ref.id); pendingParents.push({ id: ref.id, ref: field(row, ['ReportsToPID', 'ReportsTo', 'ManagerPID', 'Supervisor']) }); report.contactsCreated++;
     }
-
-    // ----------------------------------------------------
-    // STEP 5 & 6: Process WORKLIST Worksheet (Engagements & Tasks)
-    // ----------------------------------------------------
-    const worklistSheet = workbookResult.sheets.find((s) => s.recognizedType === 'WORKLIST');
-    if (worklistSheet) {
-      report.totalSheetsProcessed++;
-      report.detailedLogs.push(`Processing Worklist Sheet "${worklistSheet.sheetName}" with ${worklistSheet.rows.length} rows...`);
-
-      for (let i = 0; i < worklistSheet.rows.length; i++) {
-        const row = worklistSheet.rows[i];
-        const orgNameOrId = this.getField(row, ['OrganisationName', 'Organisation', 'TargetName', 'Company', 'OrgID']);
-        let targetOrgId = orgNameOrId ? orgIdMap.get(orgNameOrId) || orgIdMap.get(this.normalizeOrgName(orgNameOrId)) || '' : '';
-
-        if (!targetOrgId && existingOrgs.length > 0) {
-          const match = this.matchOrganisation(orgNameOrId, existingOrgs);
-          targetOrgId = match ? match.id : existingOrgs[0].id;
-        }
-
-        const title = this.getField(row, ['Title', 'Task', 'Subject', 'ActionItem', 'Engagement', 'Activity']) || 'Follow-Up Task';
-        const dateRaw = this.getField(row, ['Date', 'EngagementDate', 'DueDate', 'FollowUpDate', 'Schedule']);
-        const validDate = dateRaw && !isNaN(Date.parse(dateRaw)) ? new Date(dateRaw).toISOString() : new Date().toISOString();
-        const details = this.getField(row, ['Details', 'Description', 'Notes', 'Minutes']) || title;
-        const outcome = this.getField(row, ['Outcome', 'Result', 'Deliverable']) || '';
-
-        try {
-          // Log Engagement
-          await engagementService.create({
-            organisationId: targetOrgId,
-            contactId: null,
-            engagementType: 'MEETING_ONSITE',
-            engagementDate: validDate,
-            purpose: 'FOLLOW_UP',
-            details,
-            outcome,
-            status: 'COMPLETED',
-            nextEngagementDate: null,
-            engagementCycle: null,
-            engagementCycleDescription: null,
-            assignedTo: userId,
-            createdBy: userId,
-            updatedBy: userId,
-            createdByName: userName,
-            updatedByName: userName,
-          });
-          report.engagementsCreated++;
-
-          // Create corresponding Follow-Up Task
-          await taskService.create({
-            organisationId: targetOrgId,
-            contactId: null,
-            engagementId: null,
-            opportunityId: null,
-            assignedTo: userId,
-            title,
-            description: details,
-            dueDate: validDate,
-            priority: 'MEDIUM',
-            status: 'OPEN',
-            createdBy: userId,
-            updatedBy: userId,
-            createdByName: userName,
-            updatedByName: userName,
-          });
-          report.tasksCreated++;
-        } catch (err: any) {
-          report.validationErrors.push({
-            entity: 'Worklist',
-            row: i + 1,
-            error: `Failed to import worklist item: ${err.message}`,
-          });
-        }
-      }
+    for (const pending of pendingParents) {
+      if (!pending.ref) continue;
+      const parent = contactMap.get(pending.ref) || contactMap.get(normalizeString(pending.ref));
+      if (!parent || parent === pending.id) { report.contactsHierarchyUnresolved++; continue; }
+      batch.update(doc(db, 'contacts', pending.id), { reportsToContactId: parent, updatedBy: user.uid, updatedAt: now }); report.contactsHierarchyLinked++;
     }
+    report.totalSheetsProcessed += contactSheet ? 1 : 0;
 
-    // ----------------------------------------------------
-    // STEP 7 & 8: Process OPPORTUNITIES Worksheet
-    // ----------------------------------------------------
-    const oppsSheet = workbookResult.sheets.find((s) => s.recognizedType === 'OPPORTUNITIES');
-    if (oppsSheet) {
-      report.totalSheetsProcessed++;
-      report.detailedLogs.push(`Processing Opportunities Sheet "${oppsSheet.sheetName}" with ${oppsSheet.rows.length} rows...`);
-
-      for (let i = 0; i < oppsSheet.rows.length; i++) {
-        const row = oppsSheet.rows[i];
-        const title = this.getField(row, ['Title', 'OpportunityName', 'Deal', 'Opportunity', 'Scope']);
-        if (!title) {
-          report.validationErrors.push({
-            entity: 'Opportunities',
-            row: i + 1,
-            error: 'Opportunity Title is required.',
-          });
-          continue;
-        }
-
-        const orgNameOrId = this.getField(row, ['OrganisationName', 'Organisation', 'TargetName', 'Company', 'OrgID']);
-        let targetOrgId = orgNameOrId ? orgIdMap.get(orgNameOrId) || orgIdMap.get(this.normalizeOrgName(orgNameOrId)) || '' : '';
-        if (!targetOrgId && existingOrgs.length > 0) {
-          const match = this.matchOrganisation(orgNameOrId, existingOrgs);
-          targetOrgId = match ? match.id : existingOrgs[0].id;
-        }
-
-        const rawVal = this.getField(row, ['EstimatedValue', 'Value', 'DealValue', 'Amount', 'Budget']);
-        const estimatedValue = parseFloat(rawVal.replace(/[^0-9.-]+/g, '')) || 0;
-        const currency = this.getField(row, ['Currency', 'Curr']) || 'PGK';
-        const solutionCategory = this.getField(row, ['SolutionCategory', 'Solution', 'Category', 'Product']) || 'Cloud & Data Centre Solutions';
-
-        const stageRaw = this.getField(row, ['PipelineStage', 'Stage']).toUpperCase();
-        const pipelineStage = stageRaw.includes('QUAL')
-          ? 'QUALIFIED'
-          : stageRaw.includes('DISC')
-          ? 'DISCOVERY'
-          : stageRaw.includes('SOL')
-          ? 'SOLUTION_DEVELOPMENT'
-          : stageRaw.includes('PROP')
-          ? 'PROPOSAL'
-          : stageRaw.includes('NEG')
-          ? 'NEGOTIATION'
-          : stageRaw.includes('CLOSE')
-          ? 'CLOSED'
-          : 'IDENTIFIED';
-
-        const statusRaw = this.getField(row, ['Status']).toUpperCase();
-        const status = statusRaw.includes('WON')
-          ? 'WON'
-          : statusRaw.includes('LOST')
-          ? 'LOST'
-          : statusRaw.includes('UNCONV')
-          ? 'UNCONVERTED'
-          : 'OPEN';
-
-        try {
-          await opportunityService.create({
-            organisationId: targetOrgId,
-            contactId: null,
-            title,
-            solutionCategory,
-            estimatedValue,
-            currency,
-            pipelineStage,
-            status,
-            discoveredDate: new Date().toISOString(),
-            description: this.getField(row, ['Description', 'ScopeOfWork', 'Overview']),
-            notes: this.getField(row, ['Notes', 'Comments']),
-            accountManagerId: null,
-            referredDate: null,
-            closedDate: status === 'WON' || status === 'LOST' ? new Date().toISOString() : null,
-            winReason: status === 'WON' ? 'Successfully converted from migration import' : null,
-            lossReason: status === 'LOST' ? 'Imported as historical lost opportunity' : null,
-            bdmOwnerId: userId,
-            createdBy: userId,
-            updatedBy: userId,
-            createdByName: userName,
-            updatedByName: userName,
-          });
-
-          report.opportunitiesCreated++;
-        } catch (err: any) {
-          report.validationErrors.push({
-            entity: 'Opportunities',
-            row: i + 1,
-            error: `Failed to import opportunity: ${err.message}`,
-          });
-        }
-      }
+    const worklist = workbookResult.sheets.find((s) => s.recognizedType === 'WORKLIST');
+    for (const [index, row] of (worklist?.rows || []).entries()) {
+      const orgName = field(row, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client', 'TargetName']); const orgId = orgMap.get(normalizeString(orgName)); const date = parseDate(row[Object.keys(row).find((k) => cleanKey(k) === 'engagementdate') || '']);
+      if (!orgId || !date) { report.validationErrors.push({ entity: 'Worklist', row: index + 1, error: `${!orgId ? 'Organisation could not be resolved. ' : ''}${!date ? 'EngagementDate is missing or invalid.' : ''}` }); continue; }
+      const engagementRef = doc(collection(db, 'engagements')); const taskRef = doc(collection(db, 'tasks')); const details = field(row, ['EngagementDetails', 'Details', 'Description', 'Notes']);
+      batch.set(engagementRef, { id: engagementRef.id, organisationId: orgId, contactId: null, assignedTo: user.uid, engagementType: 'OTHER', engagementDate: date, purpose: 'FOLLOW_UP', details, outcome: field(row, ['Outcome', 'Result']), status: 'COMPLETED', engagementCycle: null, engagementCycleDescription: null, nextEngagementDate: parseDate(field(row, ['NextEngagementDate', 'NextFollowUpDate', 'FollowUpDate'])), createdAt: now, createdBy: user.uid, updatedAt: now, updatedBy: user.uid });
+      batch.set(taskRef, { id: taskRef.id, organisationId: orgId, contactId: null, engagementId: engagementRef.id, opportunityId: null, assignedTo: user.uid, title: field(row, ['Action', 'Task', 'Title', 'Subject']) || 'Follow-Up Task', description: details, dueDate: parseDate(field(row, ['NextEngagementDate', 'NextFollowUpDate', 'FollowUpDate'])) || date, priority: 'MEDIUM', status: 'OPEN', completedDate: null, completedBy: null, createdAt: now, createdBy: user.uid, updatedAt: now, updatedBy: user.uid });
+      report.engagementsCreated++; report.tasksCreated++;
     }
+    report.totalSheetsProcessed += worklist ? 1 : 0;
 
-    report.detailedLogs.push('Migration workflow execution completed.');
+    const oppSheet = workbookResult.sheets.find((s) => s.recognizedType === 'OPPORTUNITIES');
+    for (const [index, row] of (oppSheet?.rows || []).entries()) {
+      const orgName = field(row, ['Client', 'Entity', 'Organisation', 'OrganisationName', 'Company']); const orgId = orgMap.get(normalizeString(orgName)); const title = field(row, ['OpportunitiesSalesReferrals', 'Opportunity', 'Deal', 'Title']);
+      if (!orgId || !title) { report.validationErrors.push({ entity: 'Opportunities', row: index + 1, error: `${!orgId ? 'Organisation could not be resolved. ' : ''}${!title ? 'Opportunity title is missing.' : ''}` }); continue; }
+      const ref = doc(collection(db, 'opportunities')); const rawValue = field(row, ['Estimated Deal Size', 'EstimatedValue', 'DealValue', 'Amount', 'Value']); const value = Number(rawValue.replace(/[^0-9.-]/g, '')) || 0; const statusRaw = field(row, ['OSR_Status', 'Status']).toUpperCase(); const status = statusRaw.includes('WON') ? 'WON' : statusRaw.includes('LOST') ? 'LOST' : statusRaw.includes('UNCONV') ? 'UNCONVERTED' : 'OPEN';
+      batch.set(ref, { id: ref.id, organisationId: orgId, contactId: null, title, description: field(row, ['Description', 'Scope', 'Overview']), solutionCategory: field(row, ['SolutionCategory', 'Solution', 'Category', 'Product']) || 'General', discoveredDate: parseDate(field(row, ['DateUncovered', 'DiscoveredDate'])) || now, status, pipelineStage: status === 'WON' || status === 'LOST' ? 'CLOSED' : 'IDENTIFIED', estimatedValue: value, currency: field(row, ['Currency', 'Curr']) || 'PGK', bdmOwnerId: user.uid, accountManagerId: null, referredDate: null, closedDate: parseDate(field(row, ['DateClosed', 'ClosedDate'])), winReason: status === 'WON' ? 'Imported historical record' : null, lossReason: status === 'LOST' ? 'Imported historical record' : null, notes: field(row, ['Notes', 'Comments']), createdAt: now, createdBy: user.uid, updatedAt: now, updatedBy: user.uid });
+      report.opportunitiesCreated++;
+    }
+    report.totalSheetsProcessed += oppSheet ? 1 : 0;
+
+    if (report.validationErrors.length) throw new Error(`Import validation changed during commit; ${report.validationErrors.length} issue(s) require review.`);
+    await batch.commit();
+    report.detailedLogs.push('Deterministic Firestore batch committed successfully.');
     return report;
   },
 };
