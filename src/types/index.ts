@@ -9,7 +9,7 @@ export interface UserProfile {
   department: string;
   active: boolean;
   photoURL?: string | null;
-  createdAt: string; // ISO string or timestamp
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -33,9 +33,11 @@ export interface Organisation {
   lastEngagementDate: string | null;
   nextFollowUpDate: string | null;
   createdAt: string;
-  createdBy: string; // User UID
+  createdBy: string;
   updatedAt: string;
-  updatedBy: string; // User UID
+  updatedBy: string;
+  sourceSystem?: string;
+  sourceId?: string | null;
   createdByName?: string;
   updatedByName?: string;
 }
@@ -73,9 +75,11 @@ export interface Contact {
   status: ContactStatus;
   notes: string;
   createdAt: string;
-  createdBy: string; // User UID
+  createdBy: string;
   updatedAt: string;
-  updatedBy: string; // User UID
+  updatedBy: string;
+  sourceSystem?: string;
+  sourceId?: string | null;
   createdByName?: string;
   updatedByName?: string;
 }
@@ -108,20 +112,22 @@ export interface Engagement {
   id: string;
   organisationId: string;
   contactId: string | null;
-  assignedTo: string; // User UID
+  assignedTo: string;
   engagementType: EngagementType;
-  engagementDate: string; // ISO string
+  engagementDate: string;
   purpose: EngagementPurpose;
   details: string;
   outcome: string;
   status: EngagementStatus;
   engagementCycle: number | null;
   engagementCycleDescription: string | null;
-  nextEngagementDate: string | null; // ISO string
+  nextEngagementDate: string | null;
   createdAt: string;
-  createdBy: string; // User UID
+  createdBy: string;
   updatedAt: string;
-  updatedBy: string; // User UID
+  updatedBy: string;
+  sourceSystem?: string;
+  sourceId?: string | null;
   createdByName?: string;
   updatedByName?: string;
   assignedToName?: string;
@@ -136,18 +142,20 @@ export interface Task {
   contactId: string | null;
   engagementId: string | null;
   opportunityId: string | null;
-  assignedTo: string; // User UID
+  assignedTo: string;
   title: string;
   description: string;
-  dueDate: string; // ISO string
+  dueDate: string;
   priority: TaskPriority;
   status: TaskStatus;
   completedDate: string | null;
-  completedBy: string | null; // User UID
+  completedBy: string | null;
   createdAt: string;
-  createdBy: string; // User UID
+  createdBy: string;
   updatedAt: string;
-  updatedBy: string; // User UID
+  updatedBy: string;
+  sourceSystem?: string;
+  sourceId?: string | null;
   createdByName?: string;
   updatedByName?: string;
   assignedToName?: string;
@@ -172,22 +180,24 @@ export interface Opportunity {
   title: string;
   description: string;
   solutionCategory: string;
-  discoveredDate: string; // ISO string
+  discoveredDate: string;
   status: OpportunityStatus;
   pipelineStage: PipelineStage;
   estimatedValue: number;
   currency: string;
-  bdmOwnerId: string; // User UID
-  accountManagerId: string | null; // User UID
+  bdmOwnerId: string;
+  accountManagerId: string | null;
   referredDate: string | null;
   closedDate: string | null;
   winReason: string | null;
   lossReason: string | null;
   notes: string;
   createdAt: string;
-  createdBy: string; // User UID
+  createdBy: string;
   updatedAt: string;
-  updatedBy: string; // User UID
+  updatedBy: string;
+  sourceSystem?: string;
+  sourceId?: string | null;
   createdByName?: string;
   updatedByName?: string;
   bdmOwnerName?: string;
