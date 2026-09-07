@@ -47,9 +47,7 @@ export interface ImportPlan {
   readyForReview: boolean;
 }
 
-const cleanKey = (value: string): string =>
-  value.toLowerCase().replace(/[^a-z0-9]/g, '');
-
+const cleanKey = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]/g, '');
 const normalise = (value: unknown): string => String(value ?? '').trim();
 
 const dateValue = (value: unknown): Date | null => {
@@ -92,7 +90,7 @@ const classifySheet = (name: string, headers: string[]): ImportSheetType => {
   return 'UNKNOWN';
 };
 
-const mappingFor = (headers: string[], type: ImportSheetType): ImportMapping[] => {
+const mappingFor = (headers: string[], _type: ImportSheetType): ImportMapping[] => {
   const targetAliases: Record<string, string[]> = {
     organisationName: ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client', 'TargetName'],
     sourceId: ['EID', 'PID', 'SeqUpdateID', 'OSR_ID', 'ID'],
@@ -126,10 +124,6 @@ const mappingFor = (headers: string[], type: ImportSheetType): ImportMapping[] =
     if (!target) continue;
     mappings.push({ source: header, target: target[0], confidence: target[1][0] === header ? 'HIGH' : 'MEDIUM' });
   }
-
-  if (type === 'TARGETS' && mappings.some((m) => m.target === 'organisationName')) {
-    return mappings;
-  }
   return mappings;
 };
 
@@ -143,6 +137,9 @@ const matchOrganisation = (rawName: string, organisations: Organisation[]) => {
   const alias = organisations.find((org) => (org.aliases || []).some((value) => normalizeString(value) === candidate));
   if (alias) return { org: alias, confidence: 98 };
 
+  const sourceId = organisations.find((org) => org.sourceId && normalizeString(org.sourceId) === candidate);
+  if (sourceId) return { org: sourceId, confidence: 100 };
+
   let best: { org: Organisation; confidence: number } | null = null;
   for (const org of organisations) {
     const confidence = Math.round(calculateSimilarity(candidate, normalizeString(org.name)) * 100);
@@ -155,6 +152,7 @@ const matchUser = (name: string, users: UserProfile[]): UserProfile | null => {
   const candidate = normalizeString(name);
   if (!candidate) return null;
   return users.find((user) => normalizeString(user.displayName) === candidate) ||
+    users.find((user) => normalizeString(user.email) === candidate) ||
     users.find((user) => normalizeString(user.displayName).includes(candidate) || candidate.includes(normalizeString(user.displayName))) || null;
 };
 
@@ -199,11 +197,54 @@ export const businessImportPlanner = {
       }
 
       const match = matchOrganisation(sourceName, existingOrganisations);
-      const action = !match ? 'CREATE' : match.confidence >= 95 ? 'MATCH' : 'REVIEW';
-      if (action === 'REVIEW') {
+      const duplicateInWorkbook = targetRows.some((candidate, candidateIndex) => {
+        if (candidateIndex >= index) return false;
+        const candidateName = findField(candidate, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client', 'TargetName']);
+        const candidateId = findField(candidate, ['EID', 'ID', 'TargetID', 'OrgID']);
+        return normalizeString(candidateName) === normalizeString(sourceName) || (!!sourceId && !!candidateId && normalizeString(candidateId) === normalizeString(sourceId));
+      });
+      const action = duplicateInWorkbook ? 'SKIP' : !match ? 'CREATE' : match.confidence >= 95 ? 'MATCH' : 'REVIEW';
+
+      if (duplicateInWorkbook) {
+        issues.push({ sheet: targets?.sheetName || 'Targets', row: index + 4, severity: 'ERROR', message: `Duplicate organisation entry in workbook: "${sourceName}"${sourceId ? ` (${sourceId})` : ''}.` });
+      } else if (action === 'REVIEW') {
         issues.push({ sheet: targets?.sheetName || 'Targets', row: index + 4, severity: 'WARNING', message: `Possible organisation match: "${sourceName}" → "${match?.org.name}" (${match?.confidence}% confidence).` });
       }
       organisations.push({ sourceRow: index + 4, sourceId, sourceName, matchedOrganisationId: match?.org.id || null, matchedOrganisationName: match?.org.name || null, confidence: match?.confidence || 0, action });
+    });
+
+    // Include organisations that the same workbook will create/match when validating dependent sheets.
+    // This prevents valid contacts, engagements and opportunities from being incorrectly rejected
+    // simply because their organisation is new to Firestore.
+    const importOrganisations: Organisation[] = [...existingOrganisations];
+    const stagedIds = new Set(existingOrganisations.map((org) => org.id));
+    organisations.forEach((candidate, index) => {
+      if (candidate.action === 'SKIP' || candidate.action === 'REVIEW') return;
+      const id = candidate.matchedOrganisationId || `__import_org_${index + 1}`;
+      if (stagedIds.has(id)) return;
+      stagedIds.add(id);
+      importOrganisations.push({
+        id,
+        name: candidate.sourceName,
+        aliases: [],
+        category: 'PRIMARY',
+        sector: '',
+        priority: 'MEDIUM',
+        status: 'ACTIVE',
+        assignedBDMId: null,
+        location: '',
+        website: '',
+        description: '',
+        notes: '',
+        lastEngagementDate: null,
+        nextFollowUpDate: null,
+        createdAt: '',
+        createdBy: '',
+        updatedAt: '',
+        updatedBy: '',
+        sourceSystem: 'BDM Workbook Import',
+        sourceId: candidate.sourceId || null,
+      });
     });
 
     const contactsSheet = parsed.sheets.find((sheet) => sheet.type === 'CONTACTS');
@@ -211,16 +252,17 @@ export const businessImportPlanner = {
     let contactResolvable = 0;
     let contactUnresolved = 0;
     let hierarchyResolvable = 0;
+    const knownContactRefs = new Set(existingContacts.flatMap((contact) => [contact.id, contact.sourceId || '', contact.email, contact.fullName].filter(Boolean).map(normalizeString)));
     contactRows.forEach((row, index) => {
-      const orgName = findField(row, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client']);
-      const orgMatch = matchOrganisation(orgName, existingOrganisations);
+      const orgName = findField(row, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client', 'TargetName', 'OrgID']);
+      const orgMatch = matchOrganisation(orgName, importOrganisations);
       if (orgMatch) contactResolvable++; else {
         contactUnresolved++;
         issues.push({ sheet: contactsSheet?.sheetName || 'Contacts', row: index + 4, severity: 'ERROR', message: `Contact organisation could not be resolved: "${orgName || '(blank)'}".` });
       }
       const parentPid = findField(row, ['ReportsToPID', 'ReportsTo', 'ManagerPID', 'Supervisor']);
-      if (!parentPid || contactRows.some((candidate) => findField(candidate, ['PID', 'ContactID', 'ID']) === parentPid)) hierarchyResolvable++;
-      else issues.push({ sheet: contactsSheet?.sheetName || 'Contacts', row: index + 4, severity: 'WARNING', message: `Reporting manager PID "${parentPid}" could not be resolved within the workbook.` });
+      if (!parentPid || knownContactRefs.has(normalizeString(parentPid)) || contactRows.some((candidate) => normalizeString(findField(candidate, ['PID', 'ContactID', 'ID', 'StakeholderID'])) === normalizeString(parentPid))) hierarchyResolvable++;
+      else issues.push({ sheet: contactsSheet?.sheetName || 'Contacts', row: index + 4, severity: 'WARNING', message: `Reporting manager reference "${parentPid}" could not be resolved from existing Hub contacts or the workbook.` });
     });
 
     const worklistSheet = parsed.sheets.find((sheet) => sheet.type === 'WORKLIST');
@@ -228,8 +270,8 @@ export const businessImportPlanner = {
     let engagementResolvable = 0;
     let invalidDates = 0;
     worklistRows.forEach((row, index) => {
-      const orgName = findField(row, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client']);
-      if (matchOrganisation(orgName, existingOrganisations)) engagementResolvable++;
+      const orgName = findField(row, ['Entity', 'Organisation', 'OrganisationName', 'Company', 'Client', 'TargetName', 'OrgID']);
+      if (matchOrganisation(orgName, importOrganisations)) engagementResolvable++;
       else issues.push({ sheet: worklistSheet?.sheetName || 'Worklist', row: index + 4, severity: 'ERROR', message: `Worklist organisation could not be resolved: "${orgName || '(blank)'}".` });
       const date = dateValue(row[Object.keys(row).find((key) => cleanKey(key) === 'engagementdate') || '']);
       if (!date) {
@@ -244,8 +286,8 @@ export const businessImportPlanner = {
     let unresolvedAccountManager = 0;
     let invalidValue = 0;
     oppRows.forEach((row, index) => {
-      const client = findField(row, ['Client', 'Entity', 'Organisation', 'OrganisationName', 'Company']);
-      if (matchOrganisation(client, existingOrganisations)) opportunityResolvable++;
+      const client = findField(row, ['Client', 'Entity', 'Organisation', 'OrganisationName', 'Company', 'TargetName', 'OrgID']);
+      if (matchOrganisation(client, importOrganisations)) opportunityResolvable++;
       else issues.push({ sheet: oppSheet?.sheetName || 'Opportunities', row: index + 4, severity: 'ERROR', message: `Opportunity organisation could not be resolved: "${client || '(blank)'}".` });
 
       const am = findField(row, ['AM_Assigned', 'AccountManager', 'AccountManagerName']);
